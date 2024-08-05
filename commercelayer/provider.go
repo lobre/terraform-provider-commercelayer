@@ -2,6 +2,7 @@ package commercelayer
 
 import (
 	"context"
+
 	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/plugin"
@@ -119,6 +120,7 @@ func (c *Configuration) configureFunc(ctx context.Context, d *schema.ResourceDat
 	}
 
 	httpClient := oauth2.NewClient(newCtx, tokenSource)
+	httpClient.Transport = NewThrottledTransport(httpClient.Transport)
 
 	commercelayerClient := api.NewAPIClient(&api.Configuration{
 		HTTPClient: httpClient,
