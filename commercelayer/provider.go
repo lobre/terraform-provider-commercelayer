@@ -120,7 +120,9 @@ func (c *Configuration) configureFunc(ctx context.Context, d *schema.ResourceDat
 	}
 
 	httpClient := oauth2.NewClient(newCtx, tokenSource)
-	httpClient.Transport = NewThrottledTransport(httpClient.Transport)
+
+	// apply the rate limiter at the http transport level
+	httpClient.Transport = newThrottledTransport(httpClient.Transport)
 
 	commercelayerClient := api.NewAPIClient(&api.Configuration{
 		HTTPClient: httpClient,
