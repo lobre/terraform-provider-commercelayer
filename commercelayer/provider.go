@@ -38,6 +38,12 @@ var baseSchema = map[string]*schema.Schema{
 		DefaultFunc: schema.EnvDefaultFunc("COMMERCELAYER_AUTH_ENDPOINT", nil),
 		Description: "The Commercelayer auth endpoint",
 	},
+	"rate_limiter": {
+		Type:        schema.TypeBool,
+		Required:    false,
+		DefaultFunc: schema.EnvDefaultFunc("COMMERCELAYER_RATE_LIMITER", false),
+		Description: "Enable rate limiting when hitting commerce layer",
+	},
 }
 
 var baseResourceMap = map[string]*schema.Resource{
@@ -104,6 +110,7 @@ func (c *Configuration) configureFunc(ctx context.Context, d *schema.ResourceDat
 	clientSecret := d.Get("client_secret").(string)
 	apiEndpoint := d.Get("api_endpoint").(string)
 	authEndpoint := d.Get("auth_endpoint").(string)
+	rateLimiter := d.Get("rate_limiter").(bool)
 
 	credentials := clientcredentials.Config{
 		ClientID:     clientId,
@@ -121,8 +128,10 @@ func (c *Configuration) configureFunc(ctx context.Context, d *schema.ResourceDat
 
 	httpClient := oauth2.NewClient(newCtx, tokenSource)
 
-	// apply the rate limiter at the http transport level
-	httpClient.Transport = newThrottledTransport(httpClient.Transport)
+	if rateLimiter {
+		// apply the rate limiter at the http transport level
+		httpClient.Transport = newThrottledTransport(httpClient.Transport)
+	}
 
 	commercelayerClient := api.NewAPIClient(&api.Configuration{
 		HTTPClient: httpClient,
