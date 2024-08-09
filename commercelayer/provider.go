@@ -40,7 +40,7 @@ var baseSchema = map[string]*schema.Schema{
 	},
 	"rate_limiter": {
 		Type:        schema.TypeBool,
-		Required:    false,
+		Optional:    true,
 		DefaultFunc: schema.EnvDefaultFunc("COMMERCELAYER_RATE_LIMITER", false),
 		Description: "Enable rate limiting when hitting commerce layer",
 	},
