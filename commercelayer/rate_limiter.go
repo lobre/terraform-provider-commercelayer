@@ -33,9 +33,12 @@ package commercelayer
 
 import (
 	"errors"
+	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -55,12 +58,20 @@ type rateLimit struct {
 	// locked is true if the last request instructed that
 	// the rate limit was reached.
 	locked bool
+
+	// only one request of each type can be made at the same
+	// time to precisely enforce regulation.
+	mu sync.Mutex
 }
 
 // If we were rate limited, delay tells how long to wait before requesting again.
 // Otherwise, it returns 0 meaning that there is no need to wait.
 func (limit rateLimit) delay() time.Duration {
 	if !limit.locked {
+		return 0
+	}
+
+	if limit.interval == 0 || limit.last.IsZero() {
 		return 0
 	}
 
@@ -86,48 +97,21 @@ func (limit rateLimit) delay() time.Duration {
 // being the resource type and the second map being the operation.
 type rateLimits map[string]map[string]*rateLimit
 
-// waitForRateLimit checks if the current request is subject to rate limiting.
-// If the request is within the rate limit, it returns immediately.
-// If the request exceeds the rate limit, the function waits until the rate limit resets,
-// ensuring that subsequent requests can be made without exceeding the limit.
-func (limits *rateLimits) waitForRateLimit(resType string, op string) {
-	if _, exists := (*limits)[resType]; !exists {
-		return
-	}
-
-	if _, exists := (*limits)[resType][op]; !exists {
-		return
-	}
-
-	limit := (*limits)[resType][op]
-
-	delay := limit.delay()
-
-	if delay > 0 {
-		time.Sleep(delay)
-	}
-}
-
-// register will store rate limiting information about about a request and
-// it should be called each time a request is being made to the endpoint, so
-// that we can calculate precisely when to wait due to rate limiting.
-func (limits *rateLimits) register(resType string, op string, interval time.Duration, locked bool) {
+// get return the limit correponding to the given resource and operation
+// initializing it if needed.
+func (limits *rateLimits) get(resType string, op string) *rateLimit {
 	if _, exists := (*limits)[resType]; !exists {
 		(*limits)[resType] = make(map[string]*rateLimit)
 	}
 
-	now := time.Now()
-
 	if _, exists := (*limits)[resType][op]; !exists {
 		(*limits)[resType][op] = &rateLimit{
-			start:    now,
-			interval: interval,
+			start:  time.Now(),
+			locked: false, // unlocked initially
 		}
 	}
 
-	limit := (*limits)[resType][op]
-	limit.last = now
-	limit.locked = locked
+	return (*limits)[resType][op]
 }
 
 // A throttledTransport is a transport that takes rate limiting into account.
@@ -148,13 +132,37 @@ func newThrottledTransport(transport http.RoundTripper) http.RoundTripper {
 // If so, it waits for the expiration of the rate limits before executing the request.
 // After the request, it registers the response to update rate limits parameters.
 func (tt *throttledTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	uuid := fmt.Sprintf("%d", time.Now().UnixNano())
+
+	log.Printf("[AMER-%s] new request <%s> at: %s\n", uuid, r.Method, r.URL.Path)
+
 	resType, err := getResourceTypeFromURL(r.URL.Path)
 	if err != nil {
 		// cannot identify resource, so skip rate limiting
 		return http.DefaultTransport.RoundTrip(r)
 	}
 
-	tt.rateLimits.waitForRateLimit(resType, r.Method)
+	log.Printf("[AMER-%s] resource type extracted: %s\n", uuid, resType)
+
+	limit := tt.rateLimits.get(resType, r.Method)
+
+	log.Printf("[AMER-%s] limits details: start: %s\n", uuid, limit.start)
+	log.Printf("[AMER-%s] limits details: last: %s\n", uuid, limit.last)
+	log.Printf("[AMER-%s] limits details: interval: %s\n", uuid, limit.interval)
+	log.Printf("[AMER-%s] limits details: locked: %t\n", uuid, limit.locked)
+
+	limit.mu.Lock()
+	defer limit.mu.Unlock()
+
+	delay := limit.delay()
+
+	log.Printf("[AMER-%s] delay is: %d\n", uuid, delay)
+
+	if delay > 0 {
+		log.Printf("[AMER-%s] start waiting at: %s\n", uuid, time.Now())
+		time.Sleep(delay)
+		log.Printf("[AMER-%s] stop waiting at: %s\n", uuid, time.Now())
+	}
 
 	resp, err := tt.transport.RoundTrip(r)
 	if err != nil {
@@ -165,6 +173,9 @@ func (tt *throttledTransport) RoundTrip(r *http.Request) (*http.Response, error)
 
 	remainingHeader := resp.Header.Get("X-Ratelimit-Remaining")
 
+	log.Printf("[AMER-%s] response status code: %d\n", uuid, resp.StatusCode)
+	log.Printf("[AMER-%s] response header remaining: %s\n", uuid, remainingHeader)
+
 	if remainingHeader != "" {
 		remaining, err := strconv.Atoi(remainingHeader)
 		if err != nil {
@@ -174,12 +185,20 @@ func (tt *throttledTransport) RoundTrip(r *http.Request) (*http.Response, error)
 		locked = remaining == 0
 	}
 
-	interval, err := time.ParseDuration(resp.Header.Get("X-Ratelimit-Interval"))
+	log.Printf("[AMER-%s] locked retrieved from headers is: %t\n", uuid, locked)
+
+	interval, err := time.ParseDuration(resp.Header.Get("X-Ratelimit-Interval") + "s")
 	if err != nil {
 		return resp, nil
 	}
 
-	tt.rateLimits.register(resType, r.Method, interval, locked)
+	log.Printf("[AMER-%s] response header interval: %s\n", uuid, interval)
+
+	limit.last = time.Now()
+	limit.interval = interval
+	limit.locked = locked
+
+	log.Printf("[AMER-%s] end of request\n", uuid)
 
 	return resp, nil
 }

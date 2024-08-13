@@ -110,7 +110,7 @@ func (c *Configuration) configureFunc(ctx context.Context, d *schema.ResourceDat
 	clientSecret := d.Get("client_secret").(string)
 	apiEndpoint := d.Get("api_endpoint").(string)
 	authEndpoint := d.Get("auth_endpoint").(string)
-	rateLimiter := d.Get("rate_limiter").(bool)
+	//rateLimiter := d.Get("rate_limiter").(bool)
 
 	credentials := clientcredentials.Config{
 		ClientID:     clientId,
@@ -127,11 +127,7 @@ func (c *Configuration) configureFunc(ctx context.Context, d *schema.ResourceDat
 	}
 
 	httpClient := oauth2.NewClient(newCtx, tokenSource)
-
-	if rateLimiter {
-		// apply the rate limiter at the http transport level
-		httpClient.Transport = newThrottledTransport(httpClient.Transport)
-	}
+	httpClient.Transport = newThrottledTransport(httpClient.Transport)
 
 	commercelayerClient := api.NewAPIClient(&api.Configuration{
 		HTTPClient: httpClient,
