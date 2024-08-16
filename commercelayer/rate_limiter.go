@@ -66,7 +66,7 @@ type rateLimit struct {
 
 // If we were rate limited, delay tells how long to wait before requesting again.
 // Otherwise, it returns 0 meaning that there is no need to wait.
-func (limit rateLimit) delay() time.Duration {
+func (limit rateLimit) delay(uuid string) time.Duration {
 	if !limit.locked {
 		return 0
 	}
@@ -76,20 +76,30 @@ func (limit rateLimit) delay() time.Duration {
 	}
 
 	interval := int(limit.interval.Seconds())
+	log.Printf("[AMER-%s] delay: interval is: %d\n", uuid, interval)
 
-	secondsSinceStart := int(limit.last.Sub(limit.start))
+	secondsSinceStart := int(limit.last.Sub(limit.start).Seconds())
+	log.Printf("[AMER-%s] delay: secondsSinceStart is: %d\n", uuid, secondsSinceStart)
+
 	secondsSinceIntervalStart := secondsSinceStart % interval
+	log.Printf("[AMER-%s] delay: secondsSinceIntervalStart is: %d\n", uuid, secondsSinceIntervalStart)
+
 	secondsLeftInInterval := interval - secondsSinceIntervalStart
+	log.Printf("[AMER-%s] delay: secondsLeftInInterval is: %d\n", uuid, secondsLeftInInterval)
 
 	nextInterval := limit.last.Add(time.Duration(secondsLeftInInterval) * time.Second)
+	log.Printf("[AMER-%s] delay: nextInterval is: %s\n", uuid, nextInterval)
 
 	now := time.Now()
+	log.Printf("[AMER-%s] delay: now is: %s\n", uuid, now)
 
 	if now.After(nextInterval) {
 		return 0
 	}
 
-	return nextInterval.Sub(now)
+	delay := nextInterval.Sub(now)
+	log.Printf("[AMER-%s] delay: final delay is: %s\n", uuid, delay)
+	return delay
 }
 
 // Rate limits are per resource type and per operation.
@@ -146,17 +156,17 @@ func (tt *throttledTransport) RoundTrip(r *http.Request) (*http.Response, error)
 
 	limit := tt.rateLimits.get(resType, r.Method)
 
+	limit.mu.Lock()
+	defer limit.mu.Unlock()
+
 	log.Printf("[AMER-%s] limits details: start: %s\n", uuid, limit.start)
 	log.Printf("[AMER-%s] limits details: last: %s\n", uuid, limit.last)
 	log.Printf("[AMER-%s] limits details: interval: %s\n", uuid, limit.interval)
 	log.Printf("[AMER-%s] limits details: locked: %t\n", uuid, limit.locked)
 
-	limit.mu.Lock()
-	defer limit.mu.Unlock()
+	delay := limit.delay(uuid)
 
-	delay := limit.delay()
-
-	log.Printf("[AMER-%s] delay is: %d\n", uuid, delay)
+	log.Printf("[AMER-%s] delay is: %s\n", uuid, delay)
 
 	if delay > 0 {
 		log.Printf("[AMER-%s] start waiting at: %s\n", uuid, time.Now())
