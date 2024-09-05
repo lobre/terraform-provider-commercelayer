@@ -28,12 +28,20 @@
 //
 // Before making a new request, we will just have to wait until the beginning of this new period.
 //
+// There are two different types of limits in Commerce Layer: average and burst. Average is
+// supposed to be a limit for all requests together, whatever their resource type. And burst
+// is per resource type and per operation (create, update, ...). To simplify the algorithm,
+// and avoid having to differenciate those two limits, we will take the worst case and always
+//
+// # This above strategy works when we have the rate limiting information in previous requests before
+//
 // Note that the rate limiting happens per resource type and per operation (create, update, ...).
 package commercelayer
 
 import (
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strconv"
@@ -58,14 +66,20 @@ type rateLimit struct {
 	// locked is true if the last request instructed that
 	// the rate limit was reached.
 	locked bool
+}
 
-	// only one request of each type can be made at the same
-	// time to precisely enforce regulation.
-	mu sync.Mutex
+// print values of the current limit.
+func (limit rateLimit) print(w io.Writer, uuid string) {
+	fmt.Fprintf(w, "[AMER-%s] limits details: start: %s\n", uuid, limit.start)
+	fmt.Fprintf(w, "[AMER-%s] limits details: last: %s\n", uuid, limit.last)
+	fmt.Fprintf(w, "[AMER-%s] limits details: interval: %s\n", uuid, limit.interval)
+	fmt.Fprintf(w, "[AMER-%s] limits details: locked: %t\n", uuid, limit.locked)
 }
 
 // If we were rate limited, delay tells how long to wait before requesting again.
 // Otherwise, it returns 0 meaning that there is no need to wait.
+//
+// This method does not modify the receiver so it is passed by value.
 func (limit rateLimit) delay(uuid string) time.Duration {
 	if !limit.locked {
 		return 0
@@ -102,14 +116,14 @@ func (limit rateLimit) delay(uuid string) time.Duration {
 	return delay
 }
 
-// Rate limits are per resource type and per operation.
+// Burst rate limits are per resource type and per operation.
 // This map will store the current state of rate limits with the first level
 // being the resource type and the second map being the operation.
-type rateLimits map[string]map[string]*rateLimit
+type burstRateLimits map[string]map[string]*rateLimit
 
-// get return the limit correponding to the given resource and operation
+// get return the burst limit correponding to the given resource and operation
 // initializing it if needed.
-func (limits *rateLimits) get(resType string, op string) *rateLimit {
+func (limits *burstRateLimits) get(resType string, op string) *rateLimit {
 	if _, exists := (*limits)[resType]; !exists {
 		(*limits)[resType] = make(map[string]*rateLimit)
 	}
@@ -126,14 +140,86 @@ func (limits *rateLimits) get(resType string, op string) *rateLimit {
 
 // A throttledTransport is a transport that takes rate limiting into account.
 type throttledTransport struct {
-	transport  http.RoundTripper
-	rateLimits rateLimits
+	transport http.RoundTripper
+
+	averageRateLimit *rateLimit
+	burstRateLimits  burstRateLimits
+
+	mu sync.Mutex
 }
 
+// newThrottledTransport initializes the throttled transport.
 func newThrottledTransport(transport http.RoundTripper) http.RoundTripper {
 	return &throttledTransport{
-		transport:  transport,
-		rateLimits: make(rateLimits),
+		transport: transport,
+
+		averageRateLimit: &rateLimit{},
+		burstRateLimits:  make(burstRateLimits),
+	}
+}
+
+// wait will wait the correct amount of time to skip rate limits, being burst or average.
+func (tt *throttledTransport) wait(uuid string, resType string, op string) {
+	log.Printf("[AMER-%s] information for average limit\n", uuid)
+	tt.averageRateLimit.print(log.Writer(), uuid)
+
+	delay := tt.averageRateLimit.delay(uuid)
+	log.Printf("[AMER-%s] delay for average limit is: %s\n", uuid, delay)
+
+	if delay > 0 {
+		log.Printf("[AMER-%s] start waiting for average limit at: %s\n", uuid, time.Now())
+		time.Sleep(delay)
+		log.Printf("[AMER-%s] stop waiting for average limit at: %s\n", uuid, time.Now())
+
+		// unlock as we waited
+		tt.averageRateLimit.locked = false
+	}
+
+	burstLimit := tt.burstRateLimits.get(resType, op)
+
+	log.Printf("[AMER-%s] information for burst limit\n", uuid)
+	burstLimit.print(log.Writer(), uuid)
+
+	delay = burstLimit.delay(uuid)
+	log.Printf("[AMER-%s] delay for burst limit is: %s\n", uuid, delay)
+
+	if delay > 0 {
+		log.Printf("[AMER-%s] start waiting for burst limit at: %s\n", uuid, time.Now())
+		time.Sleep(delay)
+		log.Printf("[AMER-%s] stop waiting for burst limit at: %s\n", uuid, time.Now())
+
+		// unlock as we waited
+		burstLimit.locked = false
+	}
+}
+
+// register will record the rate limit retrieved from the response taking into account the correct limit type.
+func (tt *throttledTransport) register(resp *http.Response, uuid string, resType string, op string) {
+	locked, interval, err := extractFromHeaders(resp)
+	if err != nil {
+		// cannot find rate limiting info, skip
+		return
+	}
+
+	log.Printf("[AMER-%s] locked extracted from headers is: %t\n", uuid, locked)
+	log.Printf("[AMER-%s] interval extracted from headers: %s\n", uuid, interval)
+
+	switch interval {
+	case 60 * time.Second:
+		tt.averageRateLimit.last = time.Now()
+		tt.averageRateLimit.locked = locked
+		tt.averageRateLimit.interval = interval
+
+	case 10 * time.Second:
+		burstLimit := tt.burstRateLimits.get(resType, op)
+
+		burstLimit.last = time.Now()
+		burstLimit.locked = locked
+		burstLimit.interval = interval
+
+	default:
+		// limit type not detected, skip
+		return
 	}
 }
 
@@ -146,67 +232,35 @@ func (tt *throttledTransport) RoundTrip(r *http.Request) (*http.Response, error)
 
 	log.Printf("[AMER-%s] new request <%s> at: %s\n", uuid, r.Method, r.URL.Path)
 
+	// as the response of a request contains information for the next request,
+	// we have to introduce contention and process requests one by one
+	tt.mu.Lock()
+	defer tt.mu.Unlock()
+
 	resType, err := getResourceTypeFromURL(r.URL.Path)
 	if err != nil {
 		// cannot identify resource, so skip rate limiting
 		return http.DefaultTransport.RoundTrip(r)
 	}
 
-	log.Printf("[AMER-%s] resource type extracted: %s\n", uuid, resType)
+	var resp *http.Response
 
-	limit := tt.rateLimits.get(resType, r.Method)
+	for {
+		tt.wait(uuid, resType, r.Method)
 
-	limit.mu.Lock()
-	defer limit.mu.Unlock()
-
-	log.Printf("[AMER-%s] limits details: start: %s\n", uuid, limit.start)
-	log.Printf("[AMER-%s] limits details: last: %s\n", uuid, limit.last)
-	log.Printf("[AMER-%s] limits details: interval: %s\n", uuid, limit.interval)
-	log.Printf("[AMER-%s] limits details: locked: %t\n", uuid, limit.locked)
-
-	delay := limit.delay(uuid)
-
-	log.Printf("[AMER-%s] delay is: %s\n", uuid, delay)
-
-	if delay > 0 {
-		log.Printf("[AMER-%s] start waiting at: %s\n", uuid, time.Now())
-		time.Sleep(delay)
-		log.Printf("[AMER-%s] stop waiting at: %s\n", uuid, time.Now())
-	}
-
-	resp, err := tt.transport.RoundTrip(r)
-	if err != nil {
-		return nil, err
-	}
-
-	locked := resp.StatusCode == http.StatusTooManyRequests
-
-	remainingHeader := resp.Header.Get("X-Ratelimit-Remaining")
-
-	log.Printf("[AMER-%s] response status code: %d\n", uuid, resp.StatusCode)
-	log.Printf("[AMER-%s] response header remaining: %s\n", uuid, remainingHeader)
-
-	if remainingHeader != "" {
-		remaining, err := strconv.Atoi(remainingHeader)
+		resp, err = tt.transport.RoundTrip(r)
 		if err != nil {
-			return resp, nil
+			return nil, err
 		}
 
-		locked = remaining == 0
+		log.Printf("[AMER-%s] response status code: %d\n", uuid, resp.StatusCode)
+
+		tt.register(resp, uuid, resType, r.Method)
+
+		if resp.StatusCode != http.StatusTooManyRequests {
+			break
+		}
 	}
-
-	log.Printf("[AMER-%s] locked retrieved from headers is: %t\n", uuid, locked)
-
-	interval, err := time.ParseDuration(resp.Header.Get("X-Ratelimit-Interval") + "s")
-	if err != nil {
-		return resp, nil
-	}
-
-	log.Printf("[AMER-%s] response header interval: %s\n", uuid, interval)
-
-	limit.last = time.Now()
-	limit.interval = interval
-	limit.locked = locked
 
 	log.Printf("[AMER-%s] end of request\n", uuid)
 
@@ -229,4 +283,25 @@ func getResourceTypeFromURL(urlPath string) (string, error) {
 	}
 
 	return parts[0], nil
+}
+
+// extractFromHeaders will extract the rate limiting information from the response headers.
+func extractFromHeaders(resp *http.Response) (locked bool, interval time.Duration, err error) {
+	remainingHeader := resp.Header.Get("X-Ratelimit-Remaining")
+
+	if remainingHeader != "" {
+		remaining, err := strconv.Atoi(remainingHeader)
+		if err != nil {
+			return false, 0, err
+		}
+
+		locked = remaining == 0
+	}
+
+	interval, err = time.ParseDuration(resp.Header.Get("X-Ratelimit-Interval") + "s")
+	if err != nil {
+		return false, 0, err
+	}
+
+	return
 }
