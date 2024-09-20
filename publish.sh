@@ -20,7 +20,7 @@ echo "remove old dist $dist"
 rm -rf "$dist"
 
 echo "create $dist"
-mkdir "$dist"
+mkdir -p "$dist"
 
 echo "build go code"
 CGO_ENABLED=0 go build -o "$bin"
@@ -38,8 +38,8 @@ echo "create manifest"
 cp terraform-registry-manifest.json "$dist/$manifest"
 
 echo "create shasum"
-shasum -a 256 "$dist/$archive" > "$dist/$sha"
-shasum -a 256 "$dist/$manifest" >> "$dist/$sha"
+shasum -a 256 "$dist/$archive" | sed "s|$dist/||" > "$dist/$sha"
+shasum -a 256 "$dist/$manifest" | sed "s|$dist/||" >> "$dist/$sha"
 
 echo "add signature"
 gpg --output "$dist/$sig" --detach-sign "$dist/$sha"
