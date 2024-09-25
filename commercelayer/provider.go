@@ -127,7 +127,6 @@ func (c *Configuration) configureFunc(ctx context.Context, d *schema.ResourceDat
 	}
 
 	httpClient := oauth2.NewClient(newCtx, tokenSource)
-	httpClient.Transport = newThrottledTransport(httpClient.Transport)
 
 	if rateLimiter {
 		httpClient.Transport = &throttledTransport{
